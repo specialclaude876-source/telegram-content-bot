@@ -1,43 +1,48 @@
-
 import logging
 import os
 import sqlite3
-
-from dotenv import load_dotenv
-
-load_dotenv()
+from pathlib import Path
 from contextlib import closing
 
+from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatType
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Load .env locally (Termux). Railway variables are loaded automatically.
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
+MAX_ITEMS = 20
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Put it in .env before starting the bot.")
+    raise RuntimeError(
+        "BOT_TOKEN is missing. Add BOT_TOKEN to Railway Variables or your local .env file."
+    )
+
 if not ADMIN_ID_RAW.isdigit():
-    raise RuntimeError("ADMIN_ID is missing or invalid. Put your numeric Telegram user ID in .env.")
+    raise RuntimeError(
+        "ADMIN_ID is missing or invalid. Add your numeric Telegram user ID to Railway Variables or .env."
+    )
 
 ADMIN_ID = int(ADMIN_ID_RAW)
 
+# Create the database directory automatically (important for Railway Volume).
+db_file = Path(DB_PATH)
+if db_file.parent != Path("."):
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("content-bot")
+logger = logging.getLogger("telegram-content-bot")
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS content (
@@ -65,15 +70,31 @@ def is_admin(update: Update) -> bool:
 
 
 def get_content():
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT position, source_chat_id, message_id FROM content ORDER BY position"
+    with closing(get_db()) as conn:
+        return conn.execute(
+            "SELECT position, source_chat_id, message_id "
+            "FROM content ORDER BY position"
         ).fetchall()
-    return rows
+
+
+def clear_content():
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM content")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='content'")
+        conn.commit()
+
+
+def add_content(source_chat_id: int, message_id: int):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO content(source_chat_id, message_id) VALUES (?, ?)",
+            (source_chat_id, message_id),
+        )
+        conn.commit()
 
 
 def set_collecting(value: bool):
-    with closing(db()) as conn:
+    with closing(get_db()) as conn:
         conn.execute(
             """
             INSERT INTO settings(key, value) VALUES('collecting', ?)
@@ -85,41 +106,28 @@ def set_collecting(value: bool):
 
 
 def is_collecting() -> bool:
-    with closing(db()) as conn:
+    with closing(get_db()) as conn:
         row = conn.execute(
             "SELECT value FROM settings WHERE key='collecting'"
         ).fetchone()
     return bool(row and row[0] == "1")
 
 
-def clear_content():
-    with closing(db()) as conn:
-        conn.execute("DELETE FROM content")
-        conn.commit()
-
-
-def add_content(source_chat_id: int, message_id: int):
-    with closing(db()) as conn:
-        conn.execute(
-            "INSERT INTO content(source_chat_id, message_id) VALUES(?, ?)",
-            (source_chat_id, message_id),
-        )
-        conn.commit()
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Admin gets a private control message instead of the public content package.
+    if not update.effective_chat or not update.message:
+        return
+
+    # Only the admin sees the control panel.
     if is_admin(update):
         count = len(get_content())
         await update.message.reply_text(
-            f"Admin panel\n\n"
-            f"Saved items: {count}/20\n"
-            f"Collecting mode: {'ON' if is_collecting() else 'OFF'}\n\n"
-            f"/setup - start collecting content\n"
-            f"/done - finish collecting\n"
-            f"/clear - delete all saved content\n"
-            f"/status - show current status\n\n"
-            f"During setup, send up to 20 messages/files/media to this chat."
+            "Admin Panel\n\n"
+            f"Saved items: {count}/{MAX_ITEMS}\n"
+            f"Collecting: {'ON' if is_collecting() else 'OFF'}\n\n"
+            "/setup - replace the current package\n"
+            "/done - finish setup\n"
+            "/status - show status\n"
+            "/clear - delete the package"
         )
         return
 
@@ -130,12 +138,13 @@ async def send_package(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     content = get_content()
 
     if not content:
-        # Keep this short and avoid exposing admin functionality to normal users.
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Content is not available yet. Please try again later."
+            text="Content is not available yet. Please try again later.",
         )
         return
+
+    failed = 0
 
     for _, source_chat_id, message_id in content:
         try:
@@ -145,40 +154,50 @@ async def send_package(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 message_id=message_id,
             )
         except Exception:
+            failed += 1
             logger.exception(
-                "Failed to copy source message %s from chat %s to %s",
-                message_id, source_chat_id, chat_id
+                "Failed to copy message %s from %s to %s",
+                message_id,
+                source_chat_id,
+                chat_id,
             )
+
+    if failed:
+        logger.error("Package delivery finished with %s failed item(s).", failed)
 
 
 async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not is_admin(update) or not update.message:
         return
 
     clear_content()
     set_collecting(True)
+
     await update.message.reply_text(
-        "Setup mode is ON.\n\n"
-        "Now send the content to this chat in the exact order you want users to receive it.\n"
-        "You can send up to 20 messages/files/media.\n\n"
+        "Setup mode ON.\n\n"
+        f"Send up to {MAX_ITEMS} items to this chat in the exact order "
+        "you want users to receive them.\n\n"
+        "Files, photos, videos, text, captions and supported spoiler media are accepted.\n"
         "When finished, send /done."
     )
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not is_admin(update) or not update.message:
         return
 
     set_collecting(False)
     count = len(get_content())
+
     await update.message.reply_text(
-        f"Setup complete.\n\nSaved: {count}/20 items.\n"
-        "Users will receive these items automatically when they press /start."
+        f"Setup complete.\n\n"
+        f"Saved: {count}/{MAX_ITEMS} items.\n"
+        "Users can now send /start to receive the package."
     )
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not is_admin(update) or not update.message:
         return
 
     clear_content()
@@ -187,13 +206,15 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not is_admin(update) or not update.message:
         return
 
     count = len(get_content())
+
     await update.message.reply_text(
-        f"Status\n\nSaved items: {count}/20\n"
-        f"Collecting mode: {'ON' if is_collecting() else 'OFF'}"
+        f"Status\n\n"
+        f"Saved items: {count}/{MAX_ITEMS}\n"
+        f"Collecting: {'ON' if is_collecting() else 'OFF'}"
     )
 
 
@@ -205,29 +226,29 @@ async def admin_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     count = len(get_content())
-    if count >= 20:
+
+    if count >= MAX_ITEMS:
         await update.message.reply_text(
-            "The maximum of 20 items is already saved. Send /done or /setup to replace them."
+            f"Maximum {MAX_ITEMS} items reached. Send /done to finish "
+            "or /setup to start a new package."
         )
         return
 
-    # Store only the source message reference. Telegram keeps the actual media;
-    # the bot later copies it to each user, preserving Telegram-supported message data.
     add_content(update.effective_chat.id, update.message.message_id)
 
-    new_count = count + 1
     await update.message.reply_text(
-        f"Saved item {new_count}/20. Send the next item or /done."
+        f"Saved item {count + 1}/{MAX_ITEMS}."
     )
 
 
-async def unknown_or_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Normal users have no controls. Ignore everything except /start.
-    if not is_admin(update):
-        return
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled Telegram error: %s", context.error, exc_info=context.error)
 
 
 def main():
+    # Make sure the database exists before the bot starts polling.
+    get_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -236,7 +257,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    # Capture all ordinary admin messages while setup mode is active.
+    # Save every non-command private message sent by the admin during setup.
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & ~filters.COMMAND,
@@ -244,13 +265,21 @@ def main():
         )
     )
 
-    # Keep all other user messages ignored.
+    # Ignore non-admin messages other than /start.
     app.add_handler(
-        MessageHandler(filters.ALL & ~filters.COMMAND, unknown_or_other)
+        MessageHandler(filters.ALL & ~filters.COMMAND, lambda u, c: None)
     )
 
-    logger.info("Bot started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot is starting...")
+    logger.info("Maximum package items: %s", MAX_ITEMS)
+    logger.info("Database: %s", DB_PATH)
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
